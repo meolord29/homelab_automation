@@ -1,0 +1,99 @@
+---
+# ==========================================
+# PLAY 1: LOCKOUT EXECUTION
+# ==========================================
+- name: Fully Disable and Lock Root Account
+  hosts: all
+  become: yes
+  tasks:
+    # 1. SYSTEM LEVEL: Lock password and remove shell
+    - name: Lock root user and disable shell
+      ansible.builtin.user:
+        name: root
+        password_lock: yes        # Disables password auth (adds '!')
+        shell: /usr/sbin/nologin  # Prevents interactive shell access
+      
+    # 2. SSH LEVEL: Modify main config
+    - name: Disable Root Login in Main SSH Config
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Restart SSH
+
+    # 3. SSH LEVEL (UBUNTU SPECIFIC): Handle drop-in configs
+    - name: Find SSH include files
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d/
+        patterns: "*.conf"
+      register: ssh_includes
+
+    - name: Disable Root Login in SSH include files
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '^PermitRootLogin.*$'
+        replace: 'PermitRootLogin no'
+      with_items: "{{ ssh_includes.files }}"
+      when: ssh_includes.matched > 0
+      notify: Restart SSH
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+# ==========================================
+# PLAY 2: VERIFICATION PHASE
+# This runs locally on the valid logic that
+# to confirm a lock, the login must FAIL.
+# ==========================================
+- name: Verify Root Lockout
+  hosts: all
+  gather_facts: no
+  connection: local
+  vars:
+    root_inventory_path: "./config_verify_root.ini"
+    # [FIX] Force Ansible to use your laptop's Python, not the server's Python path
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  tasks:
+    - name: Load Root Credentials from separate config
+      ansible.builtin.set_fact:
+        # Note: We need to parse your specific INI structure carefully here.
+        # This regex looks for the line starting with the IP, matches ansible_password=... until the next space
+        root_pass_to_test: >-
+          {{ lookup('file', root_inventory_path) 
+             | regex_search('^' + inventory_hostname + '.*ansible_password=([^ ]+)', '\1', multiline=True) 
+             | first | default('') }}
+
+    - name: Attempt SSH as root (Expect Failure)
+      ansible.builtin.command: >
+        sshpass -p "{{ root_pass_to_test }}" 
+        ssh -o BatchMode=no 
+        -o StrictHostKeyChecking=no 
+        -o ConnectTimeout=5 
+        root@{{ inventory_hostname }} "id"
+      register: ssh_result
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Validate Lockout Status
+      ansible.builtin.fail:
+        msg: "CRITICAL SECURITY FAILURE: Root login was SUCCESSFUL (RC: 0). The server is not locked down!"
+      when: ssh_result.rc == 0
+
+    # We also want to fail if the command crashed locally (127 = command not found)
+    # This prevents the 'False Positive' you just saw where sshpass failing 
+    # looked like a successful lockout.
+    - name: Validate Test Tool Integrity
+      ansible.builtin.fail:
+        msg: "TEST FAILURE: sshpass command failed to run locally. Is sshpass installed? Error: {{ ssh_result.msg | default(ssh_result.stderr) }}"
+      when: ssh_result.rc is defined and ssh_result.rc == 127
+
+    - name: Confirm Lockout Success
+      ansible.builtin.debug:
+        msg: "SUCCESS: Root login failed as expected. (SSH Return Code: {{ ssh_result.rc }}). Output: {{ ssh_result.stderr }}"
+      when: ssh_result.rc != 0 and ssh_result.rc != 127
